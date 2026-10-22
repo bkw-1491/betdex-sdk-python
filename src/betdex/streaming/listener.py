@@ -1,6 +1,7 @@
 import json
 import queue
 
+from datetime import datetime
 from typing import Any
 
 from betdex.utils import decode
@@ -75,6 +76,10 @@ class StreamListener(BaseListener):
     or one that doesn't fit its model, is queued as its dict, and a frame that
     isn't JSON as its text, so nothing is dropped silently.
 
+    The stream can deliver a level's updates out of order, so an incremental
+    older (by ``valid_at``) than the last one applied to its level, removals
+    included, is ignored: applied, a stale level would never be removed.
+
     On every connect the books are dropped and ``StreamConnected`` is queued:
     the stream can't resume, so a book from the last connection may hold levels
     long gone. Everything queued before it came from the last connection.
@@ -90,6 +95,8 @@ class StreamListener(BaseListener):
             queue.Queue() if output_queue is None else output_queue)
         self.market_books: dict[str, MarketBook] = {}
         self._levels: dict[str, dict[PriceKey, PriceLevel]] = {}
+        # When each level last changed, removed levels too: market id -> key -> valid_at.
+        self._changed_at: dict[str, dict[PriceKey, datetime]] = {}
 
     def on_data(self, raw: str) -> bool | None:
         """
@@ -119,6 +126,7 @@ class StreamListener(BaseListener):
         """
         self.market_books.clear()
         self._levels.clear()
+        self._changed_at.clear()
         self.output_queue.put(StreamConnected(connection_id=connection_id))
 
     def on_update(self, update: Any) -> None:
@@ -137,19 +145,26 @@ class StreamListener(BaseListener):
         Apply a price update to its market's book.
 
         A snapshot replaces the book; an incremental replaces the levels it
-        carries, and drops those left with no liquidity.
+        carries, and drops those left with no liquidity, skipping a level whose
+        last change is newer than the update's (see the class docstring).
 
         :param update: The update.
         :returns: The market's book after the update.
         """
-        levels = {} if update.update_type == "Snapshot" else self._levels.get(update.market_id, {})
+        snapshot = update.update_type == "Snapshot"
+        levels = {} if snapshot else self._levels.get(update.market_id, {})
+        changed_at = {} if snapshot else self._changed_at.get(update.market_id, {})
         for level in update.prices:
             key = (level.outcome_id, level.side, level.price)
+            if key in changed_at and level.valid_at < changed_at[key]:
+                continue
+            changed_at[key] = level.valid_at
             if level.liquidity > 0:
                 levels[key] = level
             else:
                 levels.pop(key, None)
         self._levels[update.market_id] = levels
+        self._changed_at[update.market_id] = changed_at
         book = MarketBook(
             market_id=update.market_id,
             event_id=update.event_id,
@@ -169,3 +184,4 @@ class StreamListener(BaseListener):
         """
         self.market_books.pop(market_id, None)
         self._levels.pop(market_id, None)
+        self._changed_at.pop(market_id, None)
