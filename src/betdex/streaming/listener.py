@@ -11,6 +11,7 @@ from betdex.streaming.resources import (
     MarketBook,
     MarketPriceUpdate,
     PriceLevel,
+    StreamConnected,
     AuthenticationUpdate,
     SubscribeUpdate,
     UnsubscribeUpdate,
@@ -53,6 +54,14 @@ class BaseListener:
         """
         return None
 
+    def on_connect(self, connection_id: str) -> None:
+        """
+        Called by ``BetDexStream.connect`` once authenticated, before subscribing,
+        on every connect and reconnect. Runs on the thread that connected.
+
+        :param connection_id: The connection id the stream gave.
+        """
+
 
 class StreamListener(BaseListener):
     """
@@ -65,6 +74,10 @@ class StreamListener(BaseListener):
     ``SubscribeUpdate``, ``UnsubscribeUpdate``). A message of an unknown type,
     or one that doesn't fit its model, is queued as its dict, and a frame that
     isn't JSON as its text, so nothing is dropped silently.
+
+    On every connect the books are dropped and ``StreamConnected`` is queued:
+    the stream can't resume, so a book from the last connection may hold levels
+    long gone. Everything queued before it came from the last connection.
 
     :param output_queue: Where updates go; a new ``queue.Queue`` if omitted.
     """
@@ -97,6 +110,16 @@ class StreamListener(BaseListener):
                 update = item
             self.on_update(update)
         return None
+
+    def on_connect(self, connection_id: str) -> None:
+        """
+        Drop every book, in place, and queue ``StreamConnected``.
+
+        :param connection_id: The connection id the stream gave.
+        """
+        self.market_books.clear()
+        self._levels.clear()
+        self.output_queue.put(StreamConnected(connection_id=connection_id))
 
     def on_update(self, update: Any) -> None:
         """

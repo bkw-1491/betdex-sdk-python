@@ -271,6 +271,16 @@ class WalletUpdate(BaseModel):
 
 
 @dataclass(kw_only=True, slots=True)
+class StreamConnected(BaseModel):
+    """
+    A ``StreamListener`` connected, or reconnected, and dropped every book it had
+    built: what came before was from the last connection. Fresh snapshots follow
+    as the subscriptions are confirmed. Not a stream message; queued by the listener.
+    """
+    connection_id: str
+
+
+@dataclass(kw_only=True, slots=True)
 class MarketBook(BaseModel):
     """
     A market's whole order book, as a ``StreamListener`` has built it from

@@ -28,7 +28,9 @@ class BetDexStream:
     if needed, then hands each frame to the listener until ``stop``.
     Nothing reconnects by itself: when the socket fails ``start`` raises
     ``BetDexSocketError``, and calling it again reconnects and resubscribes. The
-    stream can't resume, so anything sent while disconnected is lost.
+    stream can't resume, so anything sent while disconnected is lost: each
+    connect tells the listener (``on_connect``), so it can drop what it built
+    from the last connection and wait for fresh snapshots.
 
     :param conn: Supplies the access token and the default app and wallet ids.
     :param listener: Receives every frame.
@@ -80,7 +82,8 @@ class BetDexStream:
 
     def connect(self) -> None:
         """
-        Open the socket, authenticate, and send the remembered subscriptions.
+        Open the socket, authenticate, tell the listener, and send the remembered
+        subscriptions.
 
         :raises BetDexSocketError: If the socket can't be opened.
         :raises BetDexStreamAuthenticationError: If the stream doesn't accept the token.
@@ -92,12 +95,13 @@ class BetDexStream:
             self._ws = websocket.create_connection(self.url, timeout=self.timeout)
         except (websocket.WebSocketException, OSError) as exc:
             raise BetDexSocketError(f"could not connect to stream at {self.url}: {exc}") from exc
-        self.authenticate()
+        connection_id = self.authenticate()
+        self.listener.on_connect(connection_id)
         for subscription_type, ids in self.subscriptions.items():
             if ids:
                 self._send("subscribe", subscription_type, sorted(ids))
 
-    def authenticate(self) -> None:
+    def authenticate(self) -> str:
         """
         Send the access token and wait for the stream to accept it.
 
@@ -105,6 +109,7 @@ class BetDexStream:
         missing reply within ``timeout`` counts as a refusal. Frames that
         arrive meanwhile go to the listener.
 
+        :returns: The connection id the stream gave.
         :raises BetDexStreamAuthenticationError: If no ``AuthenticationUpdate`` arrives in time.
         """
         ws = self._socket()
@@ -127,7 +132,7 @@ class BetDexStream:
                 data = None
             if isinstance(data, dict) and data.get("type") == "AuthenticationUpdate":
                 ws.settimeout(self.keepalive)
-                return
+                return data.get("connectionId", "")
             self.listener.on_data(raw)
         self.close()
         raise BetDexStreamAuthenticationError(
