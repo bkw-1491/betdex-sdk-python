@@ -15,8 +15,8 @@ from betdex.markets import Market
 from betdex.streaming import (
     UPDATE_TYPES,
     BetDexStream,
-    MarketBook,
-    OrderUpdate,
+    MarketSnapshot,
+    MarketOrderSnapshot,
     StreamListener,
     SubscribeUpdate,
     UnsubscribeUpdate,
@@ -165,7 +165,7 @@ def test_order_lifecycle(
     stream.subscribe_to_wallets()
     stream.subscribe_to_market_prices([open_market.id])
     wait_for(listener.messages, subscribed("WalletUpdate", wallet_id))
-    wait_for(listener.output_queue, lambda m: isinstance(m, MarketBook))
+    wait_for(listener.output_queue, lambda m: isinstance(m, MarketSnapshot))
 
     outcome_id = open_market.market_outcomes.ids[0]
     level = (outcome_id, "For", PRICE)
@@ -180,7 +180,8 @@ def test_order_lifecycle(
         keep_when_in_play=False, reference=reference).orders[0]
     try:
         placed = wait_for(listener.output_queue, lambda m: (
-            isinstance(m, OrderUpdate) and m.reference == reference))
+                isinstance(m, MarketOrderSnapshot) and order.id in m.orders)).orders[order.id]
+        assert placed.reference == reference
         assert (placed.order_id, placed.wallet_id, placed.status, placed.stake_unmatched) == (
             order.id, wallet_id, "Unmatched", STAKE)
         assert (placed.stake_matched, placed.liability) == (0, STAKE)
@@ -188,10 +189,41 @@ def test_order_lifecycle(
     finally:
         client.cancel_orders(order_ids=[order.id])
 
-    cancelled = wait_for(listener.output_queue, lambda m: (
-        isinstance(m, OrderUpdate) and m.reference == reference and m.status == "Cancelled"))
-    assert cancelled.stake_voided == STAKE
+    snapshot = wait_for(listener.output_queue, lambda m: (
+            isinstance(m, MarketOrderSnapshot) and order.id in m.orders
+            and m.orders[order.id].status == "Cancelled"))
+    assert snapshot.orders[order.id].stake_voided == STAKE
+    assert snapshot.market_id == open_market.id
     eventually(lambda: not in_book())
+
+
+def test_order_subscription_forms(client: BetDexClient, open_market: Market, app_id: str):
+    """
+    Subscribing by ``"{app_id}:*"`` or by order id both stream that order's changes.
+    """
+    order = client.create_order(
+        open_market.id, open_market.market_outcomes.ids[0], "For", PRICE, STAKE,
+        keep_when_in_play=False, reference=new_reference(PREFIX)).orders[0]
+    listeners = []
+    try:
+        for subscription_id in (f"{app_id}:*", order.id):
+            listener = RecordingListener()
+            stream = client.create_stream(listener)
+            stream.subscribe_to_orders([subscription_id])
+            stream.connect()
+            threading.Thread(target=stream.start, daemon=True).start()
+            listeners.append((stream, listener))
+            wait_for(listener.messages, subscribed("OrderUpdate", subscription_id))
+    finally:
+        client.cancel_orders(order_ids=[order.id])
+    try:
+        for _, listener in listeners:
+            wait_for(listener.output_queue, lambda m: (
+                    isinstance(m, MarketOrderSnapshot) and order.id in m.orders
+                    and m.orders[order.id].status == "Cancelled"))
+    finally:
+        for stream, _ in listeners:
+            stream.stop()
 
 
 def test_restart_resubscribes(client: BetDexClient, listener: RecordingListener):
