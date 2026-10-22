@@ -30,6 +30,7 @@ ISO_DATETIME = re.compile(
 )
 
 
+@cache
 def to_snake_case(key: str) -> str:
     """
     Convert an API key to its field name, e.g. ``_totalElements`` -> ``total_elements``.
@@ -110,64 +111,111 @@ def decode(tp: Any, value: Any) -> Any:
     :returns: The converted value; ``None`` stays ``None``.
     :raises BetDexDecodeError: If ``value`` doesn't have the shape of ``tp``.
     """
-    if value is None:
-        return None
+    return None if value is None else decoder(tp)(value)
 
-    try:
-        origin = typing.get_origin(tp)
 
-        if origin in (Union, types.UnionType):
-            options = [a for a in typing.get_args(tp) if a is not type(None)]
-            models = [o for o in options if dataclasses.is_dataclass(o)]
-            if len(options) == 1 or not models or not isinstance(value, dict):
-                return decode(options[0], value)
+@cache
+def decoder(tp: Any) -> Callable[[Any], Any]:
+    """
+    A function converting a non-null JSON value into ``tp``, worked out once per type:
+    ``decode`` runs on every streamed message.
+    """
+    origin = typing.get_origin(tp)
 
+    if origin in (Union, types.UnionType):
+        options = [a for a in typing.get_args(tp) if a is not type(None)]
+        models = [o for o in options if dataclasses.is_dataclass(o)]
+        if len(options) == 1 or not models:
+            return decoder(options[0])
+        first = decoder(options[0])
+
+        def union(value: Any) -> Any:
+            if not isinstance(value, dict):
+                return first(value)
             # Polymorphic lists (``Order | OrderFailure``) carry no type tag, so the
             # model covering most of the object's keys wins; ties go to the first.
             keys = {to_snake_case(k) for k in value}
-            return decode(max(models, key=lambda m: len(keys & set(get_fields(m)))), value)
+            return decoder(max(models, key=lambda m: len(keys & set(get_fields(m)))))(value)
+        return checked(tp, union)
 
-        if origin is list:
-            (item,) = typing.get_args(tp)
-            return [decode(item, v) for v in value]
+    if origin is list:
+        (item,) = typing.get_args(tp)
+        each = decoder(item)
+        return checked(tp, lambda value: [None if v is None else each(v) for v in value])
 
-        if origin is dict:
-            _, item = typing.get_args(tp)
-            return {k: decode(item, v) for k, v in value.items()}
+    if origin is dict:
+        _, item = typing.get_args(tp)
+        each = decoder(item)
+        return checked(tp, lambda value: {k: None if v is None else each(v)
+                                          for k, v in value.items()})
 
-        if origin is Literal or tp is Any:
-            return value
+    if origin is Literal or tp is Any:
+        return identity
 
-        if dataclasses.is_dataclass(tp):
-            fields = get_fields(tp)
-            kwargs: dict[str, Any] = {}
-            for key, item in value.items():
-                name = to_snake_case(key)
+    if dataclasses.is_dataclass(tp):
+        return checked(tp, model_decoder(tp))
 
+    if tp is datetime:
+        return checked(tp, parse_datetime)
+
+    if tp is float:
+        return checked(tp, lambda value: float(value) if type(value) is int else value)
+
+    return identity
+
+
+def model_decoder(tp: Any) -> Callable[[dict[str, Any]], Any]:
+    """
+    A model's decoder: each JSON key's field, and how to decode it, looked up once per key.
+    """
+    fields = get_fields(tp)
+    keys: dict[str, tuple[str, Callable[[Any], Any], bool] | None] = {}
+    has_raw = "raw" in fields
+
+    def field(key: str) -> tuple[str, Callable[[Any], Any], bool] | None:
+        name = to_snake_case(key)
+        if name not in fields:
+            return None
+        return name, decoder(fields[name]), typing.get_origin(fields[name]) is list
+
+    def model(value: dict[str, Any]) -> Any:
+        kwargs: dict[str, Any] = {}
+        for key, item in value.items():
+            spec = keys[key] if key in keys else keys.setdefault(key, field(key))
+            if spec is None:
+                continue
+            name, each, is_list = spec
+            if item is None:
                 # A list field the API sent as null keeps its empty-list default.
-                null_list = item is None and typing.get_origin(fields.get(name)) is list
-                if name in fields and not null_list:
-                    kwargs[name] = decode(fields[name], item)
+                if not is_list:
+                    kwargs[name] = None
+            else:
+                kwargs[name] = item if each is identity else each(item)
+        if has_raw and "raw" not in kwargs:
+            kwargs["raw"] = value
+        try:
+            return tp(**kwargs)
+        except TypeError as exc:  # a required field is missing
+            raise BetDexDecodeError(f"{tp.__name__}: {exc}") from exc
+    return model
 
-            if "raw" in fields and "raw" not in kwargs:
-                kwargs["raw"] = value
-            model: Any = tp
-            try:
-                return model(**kwargs)
-            except TypeError as exc:  # a required field is missing
-                raise BetDexDecodeError(f"{model.__name__}: {exc}") from exc
 
-        if tp is datetime:
-            return parse_datetime(value)
+def checked(tp: Any, convert: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """
+    ``convert``, raising ``BetDexDecodeError`` for a value of the wrong shape.
+    """
+    def run(value: Any) -> Any:
+        try:
+            return convert(value)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            # Wrong shapes (a string where a list belongs, say) surface here.
+            raise BetDexDecodeError(f"cannot decode {value!r:.100} as {tp}") from exc
+    return run
 
-        if tp is float and isinstance(value, int) and not isinstance(value, bool):
-            return float(value)
 
-        return value
+def identity(value: Any) -> Any:
+    return value
 
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
-        # Wrong shapes (a string where a list belongs, say) surface here.
-        raise BetDexDecodeError(f"cannot decode {value!r:.100} as {tp}") from exc
 
 def encode(value: Any) -> Any:
     """
